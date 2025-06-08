@@ -15,7 +15,7 @@ vote-inclusion-analyzer --url https://api.mainnet-beta.solana.com \
 ```
 
 - `--url`      RPC endpoint (e.g. https://api.mainnet-beta.solana.com)
-- `--account`  Vote account pubkey to filter for
+- `--account`  Identity pubkey to filter for
 - `--slot`     Starting slot number
 - `--distance` How many slots back to check (inclusive)
 
