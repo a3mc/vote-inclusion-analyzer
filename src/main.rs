@@ -1,23 +1,26 @@
 use anyhow::{Context, Result};
+use bincode;
+use bs58;
 use clap::Parser;
 use colored::*;
-use reqwest::Client;
+use indicatif::{ProgressBar, ProgressStyle};
 use rand::Rng;
+use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
 use solana_client::rpc_client::RpcClient;
+use solana_client::rpc_response::RpcLeaderSchedule;
+use solana_program::vote::instruction::VoteInstruction;
+use solana_program::vote::state::Vote;
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::time::sleep;
-use bs58;
-use bincode;
-use solana_program::vote::state::Vote;
-use solana_program::vote::instruction::VoteInstruction;
-use solana_client::rpc_response::RpcLeaderSchedule;
-use indicatif::{ProgressBar, ProgressStyle};
 
 #[derive(Parser, Debug)]
-#[command(name = "Vote Checker", about = "Check vote transactions by slot/account")]
+#[command(
+    name = "Vote Checker",
+    about = "Check vote transactions by slot/account"
+)]
 struct Args {
     #[arg(long)]
     url: String,
@@ -87,32 +90,46 @@ async fn get_block_with_retry(
                 return res;
             }
             Ok(None) => {
-                if attempts < max_attempts {
-                    attempts += 1;
-                    eprintln!(
-                        "Block {} not found (attempt {}). Retrying in {:?}...",
-                        slot, attempts, delay
-                    );
-                    not_found_lines += 1;
-                    sleep(delay).await;
-                    delay *= 2;
-                    continue;
-                } else {
-                    return res;
+                if not_found_lines > 0 {
+                    for _ in 0..not_found_lines {
+                        print!("\x1b[1A\x1b[2K");
+                    }
+                    print!("\r");
+                    std::io::Write::flush(&mut std::io::stdout()).unwrap();
                 }
+                return res;
             }
             Err(e) => {
+                let err_str = e.to_string();
+                let is_rate_limited = err_str.contains("429");
                 if attempts < max_attempts {
                     attempts += 1;
-                    eprintln!(
-                        "Error fetching block {}: {}. Retrying in {:?}...",
-                        slot, e, delay
-                    );
+                    if is_rate_limited {
+                        eprintln!(
+                            "{} Retrying in {:?}... (attempt {}/{})",
+                            "Rate limited (429).".yellow(),
+                            delay,
+                            attempts,
+                            max_attempts
+                        );
+                    } else {
+                        eprintln!(
+                            "Error fetching block {}: {}. Retrying in {:?}...",
+                            slot, e, delay
+                        );
+                    }
                     not_found_lines += 1;
                     sleep(delay).await;
                     delay *= 2;
                     continue;
                 } else {
+                    if not_found_lines > 0 {
+                        for _ in 0..not_found_lines {
+                            print!("\x1b[1A\x1b[2K");
+                        }
+                        print!("\r");
+                        std::io::Write::flush(&mut std::io::stdout()).unwrap();
+                    }
                     return res;
                 }
             }
@@ -127,12 +144,15 @@ async fn get_leader_map_with_retry(
 ) -> anyhow::Result<HashMap<u64, String>> {
     let mut attempts = 0;
     let mut delay = Duration::from_secs(3);
+    let mut rate_limit_lines = 0;
 
     loop {
         let pb = ProgressBar::new_spinner();
-        pb.set_style(ProgressStyle::default_spinner()
-            .template("{spinner} {msg}")
-            .unwrap());
+        pb.set_style(
+            ProgressStyle::default_spinner()
+                .template("{spinner} {msg}")
+                .unwrap(),
+        );
         pb.set_message("Fetching leader schedule...");
         pb.enable_steady_tick(Duration::from_millis(80));
 
@@ -143,20 +163,37 @@ async fn get_leader_map_with_retry(
 
         match result {
             Ok(map) => {
+                if rate_limit_lines > 0 {
+                    for _ in 0..rate_limit_lines {
+                        print!("\x1b[1A\x1b[2K");
+                    }
+                    print!("\r");
+                    std::io::Write::flush(&mut std::io::stdout()).unwrap();
+                }
                 return Ok(map);
             }
             Err(e) => {
-                let is_rate_limited = e.to_string().contains("429") || e.to_string().contains("rate limit") || e.to_string().contains("timed out");
+                let is_rate_limited = e.to_string().contains("429")
+                    || e.to_string().contains("rate limit")
+                    || e.to_string().contains("timed out");
                 if attempts < max_attempts && is_rate_limited {
                     attempts += 1;
                     eprintln!(
                         "Leader schedule fetch rate limited or timed out. Retrying in {:?}... (attempt {}/{})",
                         delay, attempts, max_attempts
                     );
+                    rate_limit_lines += 1;
                     sleep(delay).await;
                     delay *= 2;
                     continue;
                 } else {
+                    if rate_limit_lines > 0 {
+                        for _ in 0..rate_limit_lines {
+                            print!("\x1b[1A\x1b[2K");
+                        }
+                        print!("\r");
+                        std::io::Write::flush(&mut std::io::stdout()).unwrap();
+                    }
                     return Err(e).context("Failed to fetch leader schedule after retries");
                 }
             }
@@ -178,7 +215,8 @@ async fn main() -> Result<()> {
         "==============================".bright_black()
     );
 
-    let leader_map = get_leader_map_with_retry(&args.url, args.slot, 5).await
+    let leader_map = get_leader_map_with_retry(&args.url, args.slot, 5)
+        .await
         .context("Could not fetch leader schedule (rate limited or RPC error). Exiting.")?;
 
     let http_client = Client::new();
@@ -231,15 +269,17 @@ async fn main() -> Result<()> {
 
                         loop {
                             if attempts > 0 {
-                                let jitter = rng.random_range(3000..=6000);
+                                let jitter = rng.random_range(3000..=5000);
                                 sleep(delay + Duration::from_millis(jitter)).await;
                                 delay *= 2;
                             }
 
                             let pb = ProgressBar::new_spinner();
-                            pb.set_style(ProgressStyle::default_spinner()
-                                .template("{spinner} {msg}")
-                                .unwrap());
+                            pb.set_style(
+                                ProgressStyle::default_spinner()
+                                    .template("{spinner} {msg}")
+                                    .unwrap(),
+                            );
                             pb.set_message("Fetching transaction details...");
                             pb.enable_steady_tick(Duration::from_millis(80));
 
@@ -266,7 +306,9 @@ async fn main() -> Result<()> {
                                         println!(
                                             "{} Retrying in {:?}... (attempt {}/{})",
                                             "Rate limited (429).".yellow(),
-                                            delay, attempts, max_attempts
+                                            delay,
+                                            attempts,
+                                            max_attempts
                                         );
                                         rate_limit_lines += 1;
                                         continue;
@@ -285,11 +327,7 @@ async fn main() -> Result<()> {
                             }
                         }
 
-                        println!(
-                            "{:<12} {}",
-                            "Signature:",
-                            sig.dimmed()
-                        );
+                        println!("{:<12} {}", "Signature:", sig.dimmed());
 
                         match voted_slot_result {
                             Ok(Some(vote_slot)) => println!(
@@ -297,11 +335,7 @@ async fn main() -> Result<()> {
                                 "Voted slot:",
                                 vote_slot.to_string().bright_yellow()
                             ),
-                            Ok(None) => println!(
-                                "{:<12} {}",
-                                "Voted slot:",
-                                "[unknown]".dimmed()
-                            ),
+                            Ok(None) => println!("{:<12} {}", "Voted slot:", "[unknown]".dimmed()),
                             Err(e) => println!(
                                 "{:<12} {} {}",
                                 "[error]".red(),
@@ -310,13 +344,10 @@ async fn main() -> Result<()> {
                             ),
                         }
 
-                        println!(
-                            "{:<12} {}\n",
-                            "Position:",
-                            i.to_string().bright_blue()
-                        );
+                        println!("{:<12} {}\n", "Position:", i.to_string().bright_blue());
 
-                        let jitter = rng.random_range(3000..=6000);
+                        sleep(Duration::from_millis(300)).await;
+                        let jitter = rng.random_range(3000..=5000);
                         sleep(Duration::from_millis(jitter)).await;
                     }
                 } else {
@@ -333,20 +364,42 @@ async fn main() -> Result<()> {
                 }
             }
             Ok(None) => {
+                let leader_info = leader_map
+                    .get(&current_slot)
+                    .map(|l| format!("{}", l.bright_black()))
+                    .unwrap_or_else(|| "unknown".to_string());
+
                 println!(
-                    "{} {}\n",
-                    "Error:".bold().red(),
-                    format!("No block found for {}", current_slot)
+                    "\n{} {}, {} {} {}",
+                    "Warning:".bold().yellow(),
+                    format!("No block found for {}", current_slot),
+                    "likely a skipped/non-canonical slot, or RPC did not respond.".dimmed(),
+                    "Leader:".bold(),
+                    leader_info
                 );
+                sleep(Duration::from_millis(300)).await;
             }
             Err(e) => {
+                let leader_info = leader_map
+                    .get(&current_slot)
+                    .map(|l| format!("{}", l.bright_black()))
+                    .unwrap_or_else(|| "unknown".to_string());
+
                 println!(
-                    "{} {}\n",
-                    "Error:".bold().red(),
-                    format!("Failed to fetch block {}: {}", current_slot, e)
+                    "\n{} {}, {} {} {} ({})",
+                    "Warning:".bold().yellow(),
+                    format!("No block found for {}", current_slot),
+                    "likely a skipped/non-canonical slot, or RPC did not respond.".dimmed(),
+                    "Leader:".bold(),
+                    leader_info,
+                    e
                 );
             }
         }
+
+        let mut rng = rand::rng();
+        let jitter = rng.random_range(300..=600);
+        sleep(Duration::from_millis(jitter)).await;
     }
 
     println!("{}", "\nAll done!".bright_green());
@@ -364,7 +417,9 @@ fn extract_vote_transactions(block: &BlockResult) -> Vec<&Transaction> {
                 .and_then(|meta| meta.log_messages.as_ref())
                 .map_or(false, |logs| {
                     logs.iter().any(|log| {
-                        log.starts_with("Program Vote111111111111111111111111111111111111111 invoke")
+                        log.starts_with(
+                            "Program Vote111111111111111111111111111111111111111 invoke",
+                        )
                     })
                 })
         })
@@ -394,18 +449,34 @@ async fn get_block(client: &Client, api_url: &str, slot: u64) -> Result<Option<B
         .await
         .context("Failed to send getBlock request")?;
 
-    let block_resp = resp
-        .json::<BlockResponse>()
+    let value = resp
+        .json::<serde_json::Value>()
         .await
         .context("Failed to parse getBlock response")?;
+
+    if let Some(error) = value.get("error") {
+        let code = error.get("code").and_then(|c| c.as_i64());
+        if code == Some(-32009) || code == Some(-32007) {
+            return Ok(None);
+        } else if code == Some(429) {
+            anyhow::bail!("429");
+        } else {
+            let msg = error.get("message").and_then(|m| m.as_str()).unwrap_or("Unknown error");
+            if let Some(code) = code {
+                anyhow::bail!("error {}: {}", code, msg);
+            } else {
+                anyhow::bail!("{}", msg);
+            }
+        }
+    }
+
+    let block_resp: BlockResponse = serde_json::from_value(value)
+        .context("Failed to parse getBlock response as BlockResponse")?;
 
     Ok(block_resp.result)
 }
 
-async fn extract_voted_slot(
-    rpc_url: &str,
-    signature: &str,
-) -> Result<Option<u64>> {
+async fn extract_voted_slot(rpc_url: &str, signature: &str) -> Result<Option<u64>> {
     let client = reqwest::Client::new();
     let body = serde_json::json!({
         "jsonrpc": "2.0",
@@ -420,7 +491,8 @@ async fn extract_voted_slot(
         ]
     });
 
-    let resp = client.post(rpc_url)
+    let resp = client
+        .post(rpc_url)
         .json(&body)
         .send()
         .await
@@ -440,11 +512,16 @@ async fn extract_voted_slot(
             "DEBUG: Could not extract voted slot for signature {} ({}). Full transaction JSON:\n{}",
             signature,
             reason,
-            serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "<failed to serialize>".to_string())
+            serde_json::to_string_pretty(&resp)
+                .unwrap_or_else(|_| "<failed to serialize>".to_string())
         );
     };
 
-    let tx = match resp.get("result").and_then(|r| r.get("transaction")).and_then(|t| t.get("message")) {
+    let tx = match resp
+        .get("result")
+        .and_then(|r| r.get("transaction"))
+        .and_then(|t| t.get("message"))
+    {
         Some(tx) => tx,
         None => {
             print_debug("missing transaction/message");
@@ -515,11 +592,7 @@ async fn extract_voted_slot(
                 }
             }
             Ok(VoteInstruction::TowerSync(sync)) => {
-                if let Some(lockout) = sync
-                    .lockouts
-                    .iter()
-                    .find(|l| l.confirmation_count() == 1)
-                {
+                if let Some(lockout) = sync.lockouts.iter().find(|l| l.confirmation_count() == 1) {
                     return Ok(Some(lockout.slot()));
                 }
             }
@@ -538,10 +611,7 @@ async fn extract_voted_slot(
     Ok(None)
 }
 
-fn map_leader_slots(
-    client: &RpcClient,
-    slot: u64,
-) -> anyhow::Result<HashMap<u64, String>> {
+fn map_leader_slots(client: &RpcClient, slot: u64) -> anyhow::Result<HashMap<u64, String>> {
     let epoch_start = get_epoch_start_slot(client, slot)?;
     let schedule: RpcLeaderSchedule = client
         .get_leader_schedule(Some(epoch_start))?
@@ -557,10 +627,7 @@ fn map_leader_slots(
     Ok(slot_to_leader)
 }
 
-fn get_epoch_start_slot(
-    client: &RpcClient,
-    slot: u64,
-) -> anyhow::Result<u64> {
+fn get_epoch_start_slot(client: &RpcClient, slot: u64) -> anyhow::Result<u64> {
     let schedule = client.get_epoch_schedule()?;
     let epoch = schedule.get_epoch(slot);
     Ok(schedule.get_first_slot_in_epoch(epoch))
